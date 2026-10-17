@@ -14,26 +14,45 @@ def canonical(name):
     key = ''.join(c for c in name.strip().lower() if c.isalnum())
     return ALIASES.get(key, key)
 
+def read_csv_with_fallback(file, nrows=None):
+    """CICIDS2017 CSVs are not all UTF-8 (e.g. 0x96 en dash in attack labels).
+
+    Try UTF-8 first, then Windows-1252, then Latin-1; report the encoding used."""
+    last = None
+    for encoding in ('utf-8-sig', 'cp1252', 'latin-1'):
+        try:
+            return pd.read_csv(file, encoding=encoding, nrows=nrows, low_memory=False), encoding
+        except UnicodeDecodeError as exc:
+            last = exc
+    raise ValueError(f'{file.name}: could not decode with utf-8, cp1252 or latin-1: {last}')
+
 def load_flows(folder, per_file_limit=None, dayfirst=True):
     files = sorted(Path(folder).glob('*.csv'))
     if not files:
         raise ValueError(f'No CSV files in {folder}. Use demo or supply labelled flows.')
-    frames, hashes = [], {}
+    frames, hashes, encodings, blank_rows = [], {}, {}, {}
     for file in files:
         digest = hashlib.sha256()
         with file.open('rb') as stream:
             for block in iter(lambda: stream.read(1024*1024), b''):
                 digest.update(block)
         hashes[file.name] = digest.hexdigest()
-        frame = pd.read_csv(file, encoding='utf-8-sig', nrows=per_file_limit, low_memory=False)
+        frame, encodings[file.name] = read_csv_with_fallback(file, per_file_limit)
         frame.columns = [canonical(c) for c in frame.columns]
         if frame.columns.duplicated().any():
             raise ValueError(f'{file.name}: duplicate column names after normalization.')
         missing = {'src_ip','dst_ip','timestamp','label'} - set(frame.columns)
         if missing:
             raise ValueError(f'{file.name}: missing {sorted(missing)}. The stripped MachineLearningCSV export is insufficient; use GeneratedLabelledFlows.')
+        # record_id keeps the original data-row position, assigned before any removal.
         frame['record_id'] = [f'{file.name}:{i}' for i in range(len(frame))]
         frame['file'] = file.name
+        # Rows with EVERY original column empty carry no information (spreadsheet
+        # leftovers in the CICIDS2017 CSVs). Drop only those and count them per file;
+        # rows with partial data still fail the metadata checks below.
+        blank = frame.drop(columns=['record_id', 'file']).isna().all(axis=1)
+        blank_rows[file.name] = int(blank.sum())
+        frame = frame.loc[~blank]
         frames.append(frame)
     frame = pd.concat(frames, ignore_index=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'].astype(str).str.strip(), dayfirst=dayfirst, format='mixed', errors='coerce')
@@ -61,7 +80,8 @@ def load_flows(folder, per_file_limit=None, dayfirst=True):
     conflicts = frame.groupby('group').label.nunique()
     if (conflicts > 1).any():
         raise ValueError('Identical flow records have conflicting labels; resolve the annotation conflict.')
-    audit = {'rows':len(frame), 'files_sha256':hashes,
+    audit = {'rows':len(frame), 'files_sha256':hashes, 'file_encodings':encodings,
+             'fully_blank_rows_dropped':blank_rows,
              'labels':frame.label.value_counts().to_dict(), 'features':features,
              'exact_duplicate_rows':int(frame.group.duplicated().sum()),
              'feature_duplicate_rows':int(frame[features].duplicated().sum()),

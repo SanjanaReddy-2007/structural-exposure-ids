@@ -69,6 +69,27 @@ class ResearchInvariants(unittest.TestCase):
             pd.DataFrame({'Label':['BENIGN'],'Feature':[1]}).to_csv(Path(temp)/'bad.csv',index=False)
             with self.assertRaisesRegex(ValueError,'missing'):load_flows(temp)
 
+    def test_blank_rows_dropped_and_counted_but_partial_rows_fail(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            path=make_demo(temp,300);lines=Path(path).read_text().splitlines()
+            width=lines[0].count(',')
+            Path(path).write_text('\n'.join(lines[:50]+[','*width]*3+lines[50:])+'\n')
+            data,features,audit=load_flows(temp)
+            self.assertEqual(len(data),300)
+            self.assertEqual(audit['fully_blank_rows_dropped'],{'synthetic.csv':3})
+            self.assertIn('synthetic.csv:299',set(data.record_id))
+            lines=Path(path).read_text().splitlines()
+            Path(path).write_text('\n'.join(lines+[','.join(['1.1.1.1','2.2.2.2'])+','*(width-1)])+'\n')
+            with self.assertRaisesRegex(ValueError,'invalid host, time or label'):load_flows(temp)
+
+    def test_non_utf8_csv_is_decoded_and_encoding_recorded(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            path=make_demo(temp,300);text=Path(path).read_text().replace('SYNTHETIC_ATTACK','Web Attack – Brute Force')
+            Path(path).write_bytes(text.encode('cp1252'))
+            data,features,audit=load_flows(temp)
+            self.assertEqual(audit['file_encodings'],{'synthetic.csv':'cp1252'})
+            self.assertIn('Web Attack – Brute Force',set(data.label))
+
     def test_duplicate_label_conflicts_fail(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
             path=make_demo(temp,300);f=pd.read_csv(path)
