@@ -8,6 +8,16 @@ from exposure_ids.demo import make_demo
 from exposure_ids.data import load_flows, split_flows, preprocess
 from exposure_ids.graph import build_graph, exposure, rewire, retain_cross_edges, reduce_cross_degree_preserving
 
+def write_flows(folder, timestamps, durations=None, name='t.csv'):
+    n = len(timestamps)
+    pd.DataFrame({'Flow ID': [f'f{i}' for i in range(n)],
+                  'Source IP': ['10.0.0.1'] * n, 'Destination IP': ['10.0.0.2'] * n,
+                  'Timestamp': timestamps,
+                  'Flow Duration': durations if durations is not None else [100] * n,
+                  'Feature': list(range(n)),
+                  'Label': ['BENIGN', 'ATTACK'] * (n // 2) + ['BENIGN'] * (n % 2)}
+                 ).to_csv(Path(folder) / name, index=False)
+
 class ResearchInvariants(unittest.TestCase):
     def fixture(self,n=120):
         f=pd.DataFrame({'src_ip':['a']*n,'dst_ip':['b']*n,
@@ -104,6 +114,49 @@ class ResearchInvariants(unittest.TestCase):
             tr=f.loc[f.split=='train','completion'];va=f.loc[f.split=='val','completion'];te=f.loc[f.split=='test','completion']
             self.assertLess(tr.max(),va.min());self.assertLess(va.max(),te.min())
             self.assertEqual(f.groupby('completion').split.nunique().max(),1)
+
+    def test_twelve_hour_repair_is_applied_and_counted(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            write_flows(temp,['6/7/2017 9:00','6/7/2017 12:05','6/7/2017 1:30','6/7/2017 5:00'])
+            data,features,audit=load_flows(temp)
+            expected=pd.to_datetime(['2017-07-06 09:00','2017-07-06 12:05','2017-07-06 13:30','2017-07-06 17:00'])
+            self.assertEqual(data.timestamp.tolist(),list(expected))
+            self.assertEqual(data.timestamp_original.tolist(),list(expected))
+            info=audit['timestamp_files']['t.csv']
+            self.assertEqual(info['pm_shifted_rows'],2)
+            self.assertEqual(info['format'],'%d/%m/%Y %H:%M')
+            self.assertEqual(info['hour_counts_before_repair'],{1:1,5:1,9:1,12:1})
+            self.assertNotIn('timestamp_original',features)
+
+    def test_24_hour_and_mixed_timestamp_formats_fail_loudly(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            write_flows(temp,['6/7/2017 9:00','6/7/2017 17:00'])
+            with self.assertRaisesRegex(ValueError,'hours outside 1-12'):load_flows(temp)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            write_flows(temp,['6/7/2017 9:00:15','6/7/2017 9:01'])
+            with self.assertRaisesRegex(ValueError,'no single known format'):load_flows(temp)
+
+    def test_floor_to_minute_keeps_original_and_counts(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            write_flows(temp,['6/7/2017 9:00:30','6/7/2017 9:01:00'])
+            data,_,audit=load_flows(temp,floor_to_minute=True)
+            self.assertEqual(data.timestamp.tolist(),list(pd.to_datetime(['2017-07-06 09:00:00','2017-07-06 09:01:00'])))
+            self.assertEqual(data.timestamp_original.iloc[0],pd.Timestamp('2017-07-06 09:00:30'))
+            self.assertEqual(audit['timestamp_files']['t.csv']['floored_rows'],1)
+            self.assertTrue(audit['floor_to_minute'])
+
+    def test_negative_duration_strict_by_default_and_recorded_when_dropped(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            write_flows(temp,['6/7/2017 9:00','6/7/2017 9:01','6/7/2017 9:02','6/7/2017 9:03'],durations=[100,-5,0,7])
+            with self.assertRaisesRegex(ValueError,'Invalid Flow Duration'):load_flows(temp)
+            data,_,audit=load_flows(temp,drop_invalid_duration=True)
+            self.assertEqual(len(data),3)
+            fd=audit['flow_duration']
+            self.assertEqual(fd['negative_rows'],1);self.assertEqual(fd['dropped_rows'],1)
+            self.assertEqual(fd['dropped_record_ids'],['t.csv:1'])
+            self.assertEqual(fd['dropped_per_file'],{'t.csv':1})
+            self.assertEqual(fd['rows_before_filter'],4)
+            self.assertIn(0,pd.to_numeric(data.flow_duration).tolist())  # zero duration is kept
 
     @unittest.skipUnless(importlib.util.find_spec('torch'), 'PyTorch installation required')
     def test_heldout_features_cannot_change_causal_training_logits(self):
