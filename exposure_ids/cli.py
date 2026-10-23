@@ -18,7 +18,9 @@ def prepare(args):
     output=Path(args.out)
     if output.exists() and any(output.iterdir()):raise ValueError('Output folder is nonempty; choose a fresh folder to preserve run provenance.')
     output.mkdir(parents=True,exist_ok=True)
-    frame,features,audit=load_flows(args.data,args.per_file_limit,not args.monthfirst)
+    frame,features,audit=load_flows(args.data,args.per_file_limit,not args.monthfirst,
+                                    floor_to_minute=args.floor_to_minute,
+                                    drop_invalid_duration=args.drop_invalid_duration)
     frame=split_flows(frame,args.protocol,args.split_seed,args.gap_seconds)
     x,processor=preprocess(frame,features)
     splits=frame.split.to_numpy()
@@ -156,7 +158,12 @@ def main():
         p.add_argument('--split-seed',type=int,default=42);p.add_argument('--graph-seed',type=int,default=77)
         p.add_argument('--window',type=float,default=60);p.add_argument('--neighbors',type=int,default=12)
         p.add_argument('--gap-seconds',type=float,default=0);p.add_argument('--per-file-limit',type=int)
-        p.add_argument('--monthfirst',action='store_true');p.set_defaults(func=func)
+        p.add_argument('--monthfirst',action='store_true')
+        p.add_argument('--floor-to-minute',action='store_true',
+                       help='Floor all timestamps to the minute so every day has the same resolution (original kept in timestamp_original).')
+        p.add_argument('--drop-invalid-duration',action='store_true',
+                       help='Remove and record rows with negative Flow Duration instead of failing.')
+        p.set_defaults(func=func)
         if name=='run':
             p.add_argument('--seeds',type=int,nargs='+',default=[1,2,3,4,5]);p.add_argument('--levels',type=float,nargs='+',default=[0,.25,.5,.75,1])
             p.add_argument('--hidden',type=int,default=32);p.add_argument('--epochs',type=int,default=100)
